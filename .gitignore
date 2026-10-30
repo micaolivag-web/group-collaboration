@@ -1,0 +1,15 @@
+# Machine-specific identity, caches and transient group state
+.group/local/*
+!.group/local/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
