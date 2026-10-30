@@ -334,6 +334,127 @@ def cmd_pub(args: argparse.Namespace) -> int:
     print("PUB mechanical publication complete. Review/test claims are supplied by the operator, not independently verified by this helper.")
     return 0
 
+
+def cmd_rev(args: argparse.Namespace) -> int:
+    """Locate a publication and assist a human/agent review without merging code.
+
+    Default mode provides evidence only; --checked publishes an operator-reviewed
+    verdict as an immutable event. This helper cannot judge code correctness.
+    """
+    root = repository_root()
+    group = root / ".group"
+    config = load_json(group / "group.json")
+    identity = load_json(group / "local" / "identity.json")
+    person_id = identity.get("person_id")
+    validate_ids(config.get("group_id"), person_id)
+    branch_result = git("symbolic-ref", "--quiet", "--short", "HEAD", cwd=root)
+    if branch_result.returncode:
+        raise GroupError("REV requires a named branch.")
+    branch = branch_result.stdout.strip()
+    if not branch.startswith(f"people/{person_id}/"):
+        raise GroupError("Publish REV events from your personal work branch.")
+    if git("remote", "get-url", "origin", cwd=root).returncode:
+        raise GroupError("Connect the origin remote first.")
+    fetched = git("fetch", "origin", "--prune", cwd=root)
+    if fetched.returncode:
+        raise GroupError("Cannot fetch GitHub updates: " + fetched.stderr.strip())
+
+    refs = git("for-each-ref", "--format=%(refname)", "refs/remotes/origin", cwd=root)
+    matches = []
+    for ref in refs.stdout.splitlines():
+        if ref.endswith("/HEAD"):
+            continue
+        paths = git("ls-tree", "-r", "--name-only", ref, "--", ".group/events", cwd=root)
+        for path in paths.stdout.splitlines():
+            if not path.endswith(".json"):
+                continue
+            entry = git("show", f"{ref}:{path}", cwd=root)
+            if entry.returncode:
+                continue
+            try:
+                event = json.loads(entry.stdout)
+            except ValueError:
+                continue
+            if (isinstance(event, dict) and event.get("group_id") == config.get("group_id")
+                    and event.get("event_type") == "change_published"
+                    and event.get("change_id") == args.change_id):
+                matches.append(event)
+    if not matches:
+        raise GroupError(f"Published change {args.change_id} not found on remote branches. Try SYNC.")
+    event = matches[0]
+    if any((e.get("commit"), e.get("branch")) != (event.get("commit"), event.get("branch")) for e in matches):
+        raise GroupError("Conflicting publication metadata for this change ID; investigate manually.")
+    source_branch = event.get("branch", "")
+    commit = event.get("commit", "")
+    if not isinstance(source_branch, str) or not BRANCH_RE.fullmatch(source_branch):
+        raise GroupError("Published event contains invalid branch name.")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
+        raise GroupError("Published event contains invalid commit hash.")
+    exact = git("cat-file", "-t", commit, cwd=root)
+    if exact.returncode or exact.stdout.strip() != "commit":
+        raise GroupError("Published commit was not found locally after fetch.")
+    contained = git("merge-base", "--is-ancestor", commit, "refs/remotes/origin/" + source_branch, cwd=root)
+    if contained.returncode:
+        raise GroupError("Published commit is not reachable from its declared remote branch.")
+    print("Change:", args.change_id)
+    print("Author:", event.get("person_id"))
+    print("Source branch:", source_branch)
+    print("Exact code commit:", commit)
+    print("Summary:", event.get("summary", ""))
+    print("Known issues:", event.get("known_issues", []))
+    print("Interface changes:", event.get("interface_changes", []))
+    print("Declared tests:", event.get("tests_run", []))
+    # --stat is a convenience, not a substitute for reviewing the full diff.
+    diff = git("show", "--format=fuller", "--stat", commit, cwd=root)
+    if diff.returncode:
+        raise GroupError("Unable to inspect code commit: " + diff.stderr.strip())
+    print("\nCommit summary and changed files:\n" + diff.stdout)
+    print(f"To inspect full diff: git show --format=fuller {commit}")
+    print("REV does not merge code. Inspect surrounding code, run checks, and judge the result before recording a verdict.")
+    if not args.checked:
+        print("Review preview only: no review event published.")
+        return 0
+
+    if not args.verdict or not args.summary or not args.tests_run:
+        raise GroupError("To publish, provide --verdict, --summary and --tests-run with --checked.")
+    if not args.summary.strip() or not args.tests_run.strip():
+        raise GroupError("Review summary and tests must be nonempty.")
+    state = git("status", "--porcelain=v1", "--untracked-files=all", cwd=root)
+    if state.returncode or state.stdout.strip():
+        raise GroupError("Working tree must be clean before publishing a review event.")
+    now = datetime.now(timezone.utc)
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    event_id = "E-" + stamp + "-" + person_id + "-" + secrets.token_hex(4)
+    payload = {
+        "protocol_version": PROTOCOL_VERSION,
+        "event_id": event_id,
+        "event_type": "review",
+        "group_id": config["group_id"],
+        "person_id": person_id,
+        "created_at": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "related_events": [event["event_id"]],
+        "change_id": args.change_id,
+        "verdict": args.verdict,
+        "summary": args.summary.strip(),
+        "issues": args.issue or [],
+        "tests_run": [args.tests_run.strip()],
+    }
+    event_path = group / "events" / f"{event_id}.json"
+    write_json_new(event_path, payload)
+    staged = git("add", "--", str(event_path.relative_to(root)), cwd=root)
+    if staged.returncode:
+        raise GroupError("Could not stage review event: " + staged.stderr.strip())
+    recorded = git("commit", "-m", f"Review {args.change_id}: {args.verdict}", cwd=root)
+    if recorded.returncode:
+        raise GroupError("Review event commit failed: " + recorded.stderr.strip())
+    published = git("push", "origin", branch, cwd=root)
+    if published.returncode:
+        raise GroupError("Review event committed locally, but PUSH FAILED: " + published.stderr.strip())
+    print("Published review event:", event_id)
+    print("Verdict:", args.verdict)
+    print("Warning: verdict and tests are operator-reported, not automatically verified by groupctl.")
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="groupctl", description="Group collaboration helper (v0.1 starter)")
     subs = parser.add_subparsers(dest="command", required=True)
@@ -359,6 +480,14 @@ def build_parser() -> argparse.ArgumentParser:
     pub.add_argument("--not-for-integration", action="store_true")
     pub.add_argument("--checked", action="store_true", help="Confirm manual review and checks completed")
     pub.set_defaults(handler=cmd_pub)
+    rev = subs.add_parser("rev", help="Inspect a published change, then optionally publish a review event")
+    rev.add_argument("change_id", help="Exact C-... ID from SYNC")
+    rev.add_argument("--verdict", choices=["accept", "accept_with_changes", "reject", "needs_more_evidence"])
+    rev.add_argument("--summary", help="Human/agent review summary")
+    rev.add_argument("--issue", action="append", default=[], help="Review issue (repeatable)")
+    rev.add_argument("--tests-run", help="Checks actually performed, or state why unavailable")
+    rev.add_argument("--checked", action="store_true", help="Confirm manual review and publish the reported verdict")
+    rev.set_defaults(handler=cmd_rev)
     return parser
 
 
