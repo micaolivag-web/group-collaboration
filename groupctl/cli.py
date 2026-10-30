@@ -10,6 +10,7 @@ represented as a complete agent-level STATUS procedure.
 from __future__ import annotations
 
 import argparse
+import secrets
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -167,6 +168,172 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Safe, read-only discovery phase of the agent-level SYNC procedure.
+
+    This intentionally does NOT automatically merge/rebase or claim full SYNC.
+    """
+    root = repository_root()
+    config = load_json(root / ".group" / "group.json")
+    branch = git("symbolic-ref", "--quiet", "--short", "HEAD", cwd=root)
+    if branch.returncode:
+        raise GroupError("Switch to a named working branch before syncing.")
+    remote = git("remote", "get-url", "origin", cwd=root)
+    if remote.returncode:
+        raise GroupError("Missing origin remote. Connect your GitHub repository first.")
+    before = git("status", "--porcelain=v1", cwd=root)
+    if before.returncode:
+        raise GroupError(before.stderr.strip() or "Cannot inspect working tree")
+    print(f"Working branch: {branch.stdout.strip()}")
+    print(f"Uncommitted files: {len(before.stdout.splitlines())}")
+    fetched = git("fetch", "origin", "--prune", "--tags", cwd=root)
+    if fetched.returncode:
+        raise GroupError(f"Fetch failed: {fetched.stderr.strip()}")
+    canonical = str(config.get("canonical_branch", "main"))
+    upstream = f"refs/remotes/origin/{canonical}"
+    compare = git("rev-list", "--left-right", "--count", f"HEAD...{upstream}", cwd=root)
+    if compare.returncode:
+        raise GroupError(f"Cannot compare with {upstream}: {compare.stderr.strip()}")
+    ahead, behind = map(int, compare.stdout.split())
+    print(f"Relative to origin/{canonical}: {ahead} ahead, {behind} behind")
+    refs = git("for-each-ref", "--format=%(refname)", "refs/remotes/origin", cwd=root)
+    event_ids = {}
+    for ref in refs.stdout.splitlines():
+        if ref.endswith("/HEAD"):
+            continue
+        paths = git("ls-tree", "-r", "--name-only", ref, "--", ".group/events", cwd=root)
+        if paths.returncode:
+            continue
+        for path in paths.stdout.splitlines():
+            if not path.endswith(".json"):
+                continue
+            result = git("show", f"{ref}:{path}", cwd=root)
+            if result.returncode:
+                continue
+            try:
+                event = json.loads(result.stdout)
+            except ValueError:
+                print(f"WARNING: invalid JSON in {ref}:{path}")
+                continue
+            if not isinstance(event, dict) or event.get("group_id") != config.get("group_id"):
+                print(f"WARNING: invalid group event in {ref}:{path}")
+                continue
+            event_ids.setdefault(event.get("event_id", path), event)
+    print(f"Discoverable events across remote branches: {len(event_ids)}")
+    for event in sorted(event_ids.values(), key=lambda e: e.get("created_at", "")):
+        print(f"  {event.get('event_id', '?')} | {event.get('event_type', '?')} | {event.get('person_id', '?')} | {event.get('summary', '')}")
+    print("Discovery only: no merges, rebases, commits, or event publication performed.")
+    print("Full agent SYNC still requires tracking new events, considering relevance, safe canonical update, and validation.")
+    return 0
+
+
+
+def cmd_pub(args: argparse.Namespace) -> int:
+    """Publish a reviewed, already-staged contribution and a durable event.
+
+    This is a guarded mechanical helper for the agent's PUB procedure, not
+    a substitute for human/agent review of the actual code and test meaning.
+    """
+    root = repository_root()
+    group = root / ".group"
+    config = load_json(group / "group.json")
+    identity = load_json(group / "local" / "identity.json")
+    person_id = identity.get("person_id")
+    validate_ids(config.get("group_id"), person_id)
+    current = git("symbolic-ref", "--quiet", "--short", "HEAD", cwd=root)
+    if current.returncode:
+        raise GroupError("PUB requires a named personal work branch.")
+    branch = current.stdout.strip()
+    if not branch.startswith(f"people/{person_id}/"):
+        raise GroupError(f"PUB requires a branch starting with people/{person_id}/ (currently {branch}).")
+    remote = git("remote", "get-url", "origin", cwd=root)
+    if remote.returncode:
+        raise GroupError("Configure the origin remote before PUB.")
+    if not args.summary.strip():
+        raise GroupError("Provide a non-empty --summary.")
+    if not args.tests_run:
+        raise GroupError("Report actual validation using --tests-run, even if checks were unavailable.")
+    if args.tests_run.strip().lower() in ("passed", "all passed", "ok"):
+        raise GroupError("--tests-run must name the actual command or concrete check performed.")
+    staged = git("diff", "--cached", "--name-only", "--diff-filter=ACMRT", cwd=root)
+    if staged.returncode:
+        raise GroupError("Unable to inspect staged changes.")
+    files = [x for x in staged.stdout.splitlines() if x]
+    if not files:
+        raise GroupError("No staged files. Review changes, then run git add <files> before PUB.")
+    status = git("status", "--porcelain=v1", "--untracked-files=all", cwd=root)
+    if status.returncode:
+        raise GroupError("Cannot inspect working tree.")
+    # Refuse ambiguous mixed snapshots: no unstaged changes or untracked files.
+    if git("diff", "--quiet", cwd=root).returncode != 0 or any(x.startswith("??") for x in status.stdout.splitlines()):
+        raise GroupError("Unstaged/untracked files remain. Stage or discard them after review before PUB.")
+    forbidden = (".env", ".pem", ".key", "id_rsa", "credentials", "token", "secret", ".group/local/")
+    suspect = [f for f in files if any(marker in f.lower() for marker in forbidden)]
+    if suspect:
+        raise GroupError("Possible sensitive/local files staged; inspect and unstage: " + ", ".join(suspect))
+    if any(x.startswith(".group/events/") for x in files):
+        raise GroupError("PUB must not stage existing event files with the code change.")
+    if git("diff", "--cached", "--check", cwd=root).returncode:
+        raise GroupError("Staged changes fail git diff --check; fix before PUB.")
+    # A second explicit guard prevents publishing without the human/agent having
+    # run and judged suitable checks first.
+    if not args.checked:
+        print("Staged files:")
+        for f in files:
+            print("  " + f)
+        print("Review the actual diff and run the checks named in --tests-run first.")
+        print("Then rerun the same command with --checked (confirmation of prior review).")
+        return 0
+    # Commit content before producing the event, so its commit pin is exact.
+    made = git("commit", "-m", f"Publish: {args.summary.strip()}", cwd=root)
+    if made.returncode:
+        raise GroupError("Code commit failed: " + made.stderr.strip())
+    commit = git("rev-parse", "HEAD", cwd=root).stdout.strip()
+    pushed = git("push", "-u", "origin", branch, cwd=root)
+    if pushed.returncode:
+        raise GroupError("Code committed locally but PUSH FAILED; do not claim PUB completed. " + pushed.stderr.strip())
+
+    now = datetime.now(timezone.utc)
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    suffix = secrets.token_hex(4)
+    change_id = "C-" + stamp + "-" + person_id + "-" + suffix
+    event_id = "E-" + stamp + "-" + person_id + "-" + suffix
+    event_path = group / "events" / f"{event_id}.json"
+    event = {
+        "protocol_version": PROTOCOL_VERSION,
+        "event_id": event_id,
+        "event_type": "change_published",
+        "group_id": config["group_id"],
+        "person_id": person_id,
+        "created_at": now.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "related_events": [],
+        "change_id": change_id,
+        "branch": branch,
+        "commit": commit,
+        "summary": args.summary.strip(),
+        "files_changed": files,
+        "interface_changes": args.interface_change or [],
+        "tests_run": [args.tests_run],
+        "known_issues": args.known_issue or [],
+        "proposed_for_integration": not args.not_for_integration,
+    }
+    write_json_new(event_path, event)
+    stage_event = git("add", "--", str(event_path.relative_to(root)), cwd=root)
+    if stage_event.returncode:
+        raise GroupError("Code pushed, but event staging failed: " + stage_event.stderr.strip())
+    event_commit = git("commit", "-m", f"Publish event {change_id}", cwd=root)
+    if event_commit.returncode:
+        raise GroupError("Code pushed, but event commit failed: " + event_commit.stderr.strip())
+    event_push = git("push", "origin", branch, cwd=root)
+    if event_push.returncode:
+        raise GroupError("Event committed locally, but PUSH FAILED; publication incomplete: " + event_push.stderr.strip())
+    print(f"Published {change_id}")
+    print(f"Code commit: {commit}")
+    print(f"Event: {event_path.relative_to(root)}")
+    print("GitHub branch: " + branch)
+    print("PUB mechanical publication complete. Review/test claims are supplied by the operator, not independently verified by this helper.")
+    return 0
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="groupctl", description="Group collaboration helper (v0.1 starter)")
     subs = parser.add_subparsers(dest="command", required=True)
@@ -182,6 +349,16 @@ def build_parser() -> argparse.ArgumentParser:
     join.set_defaults(handler=cmd_join)
     status = subs.add_parser("status", help="Print local repository/identity snapshot (starter)")
     status.set_defaults(handler=cmd_status)
+    sync = subs.add_parser("sync", help="Fetch and inspect group state (safe discovery phase only)")
+    sync.set_defaults(handler=cmd_sync)
+    pub = subs.add_parser("pub", help="Publish staged code and immutable change_published event (guarded helper)")
+    pub.add_argument("--summary", required=True)
+    pub.add_argument("--tests-run", required=True, help="Exact command/check actually performed")
+    pub.add_argument("--interface-change", action="append", default=[])
+    pub.add_argument("--known-issue", action="append", default=[])
+    pub.add_argument("--not-for-integration", action="store_true")
+    pub.add_argument("--checked", action="store_true", help="Confirm manual review and checks completed")
+    pub.set_defaults(handler=cmd_pub)
     return parser
 
 

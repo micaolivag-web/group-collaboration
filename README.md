@@ -112,3 +112,37 @@ python -m unittest discover -s tests -v
 7. Three-clone GitHub demonstration, including successful and conflicting integrations.
 
 The definitive required behavior is in `specs/`. If the starter ever disagrees with those files, the specs win.
+
+## Milestone 2: safe SYNC discovery
+
+Run `python -m groupctl sync` from a personal work branch after configuring `origin`.
+This fetches remote refs, compares your branch with `origin/main`, and reports
+structured JSON events found on remote branches. It **does not** automatically
+merge or rebase. It is only the read-only discovery portion of the specification's
+human-to-agent `SYNC` procedure; the AI must still reason about relevance,
+previous sync state, safe canonical updates, and validations.
+
+## Milestone 3: guarded PUB mechanical helper
+
+This milestone adds `python -m groupctl pub`. It is **not** the entire human-to-agent `PUB` workflow: a person/agent must review the diff, check for secrets and unwanted files, select meaningful tests, actually run them, and assess their results. The helper only accepts staged files with a clean remainder of the working tree. It commits and pushes the work, then writes, commits, and pushes an immutable `change_published` event with the exact code commit pinned.
+
+First replace your existing `groupctl/` folder with the one from this ZIP (do not replace your `.git/` or `.group/` folders). From the personal branch `people/P17/setup`:
+
+```powershell
+python -m unittest discover -s tests -v
+git status --short
+git diff
+git add groupctl/cli.py
+git diff --cached --check
+git diff --cached
+python -m groupctl pub --summary "Add guarded PUB publication helper" --tests-run "python -m unittest discover -s tests -v"
+```
+
+The first `pub` call displays files for confirmation without publishing. Once you've genuinely reviewed the staged diff and validated the tests, rerun it with `--checked`:
+
+```powershell
+python -m groupctl pub --summary "Add guarded PUB publication helper" --tests-run "python -m unittest discover -s tests -v" --checked
+python -m groupctl sync
+```
+
+**Important:** The example above stages only `groupctl/cli.py`. Stage any other intended files deliberately. Do not claim you ran tests if you did not. If your original project already has modifications, inspect them first. You should stage/publish only coherent reviewed changes; never overwrite `.group/`, reinitialize Git, or delete your local identity. If your tests don't pass, investigate before publishing. Do not use `--checked` until the diff and actual validation have been reviewed.
