@@ -123,3 +123,61 @@ def check_integration_target() -> str:
         )
 
     return branch
+def preview_integration(event: dict) -> dict:
+    """Preview a Git integration without changing the working files."""
+
+    commit = validate_published_commit(event)
+
+    result = subprocess.run(
+        ["git", "merge-tree", "--write-tree", "HEAD", commit],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode not in (0, 1):
+        raise RuntimeError(
+            f"Git merge preview failed: {result.stderr}"
+        )
+
+    return {
+        "commit": commit,
+        "can_merge": result.returncode == 0,
+        "details": result.stdout.strip()
+    }
+
+def begin_integration(event: dict) -> dict:
+    """Begin integration, leaving changes for verification."""
+
+    if event.get("event_type") != "change_published":
+        raise ValueError("Expected a published change")
+
+    target_branch = check_integration_target()
+    preview = preview_integration(event)
+
+    if not preview["can_merge"]:
+        return {
+            "status": "conflict",
+            "target_branch": target_branch,
+            "details": preview["details"]
+        }
+
+    result = subprocess.run(
+        [
+            "git", "merge", "--no-ff", "--no-commit",
+            preview["commit"]
+        ],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Integration stopped. Inspect Git status: "
+            + result.stdout + result.stderr
+        )
+
+    return {
+        "status": "pending_verification",
+        "target_branch": target_branch,
+        "commit": preview["commit"]
+    }
