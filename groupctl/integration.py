@@ -79,3 +79,47 @@ def validate_published_commit(event: dict) -> str:
 
     return commit
 
+def inspect_published_diff(event: dict) -> str:
+    """Inspect the actual code changes in a published commit."""
+
+    commit = validate_published_commit(event)
+
+    result = subprocess.run(
+        ["git", "--no-pager", "show", "--format=", commit],
+        capture_output=True,
+        text=True,
+        check=True
+    )
+
+    return result.stdout
+
+
+
+def check_integration_target() -> str:
+    """Check that the current branch is safe for integration."""
+
+    branch_result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        capture_output=True,
+        text=True,
+        check=True
+    )
+
+    branch = branch_result.stdout.strip()
+
+    if not branch.startswith("people/"):
+        raise ValueError("INT must run on a personal branch")
+
+    status_result = subprocess.run(
+        ["git", "status", "--porcelain=v1"],
+        capture_output=True,
+        text=True,
+        check=True
+    )
+
+    if status_result.stdout.strip():
+        raise ValueError(
+            "Uncommitted changes detected. Save your work before INT."
+        )
+
+    return branch
